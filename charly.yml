@@ -61,3 +61,316 @@ pod-crabbox-k3s:
             - /sbin/init
         candy:
             - k3s-lease
+
+# =============================================================================
+# check-pod-crabbox-k3s-cluster — the disposable R10 bed for the k3s
+# control-plane lease image.
+#
+# The image's own `check:` steps are BUILD-scope: they assert the binary, its
+# checksum, the config, the units and the readiness-hook body on the built
+# artifact. A build container never starts k3s, so none of them can prove the
+# thing this image exists for: the node becomes Ready AND a workload execs
+# through apiserver -> kubelet (CONTAINERD-IMAGES.md §2.1). A node reports Ready
+# about 8 s before it is workload-usable, so "Ready" alone is not the contract
+# and is not what this bed accepts. This bed does, because the deploy boots the
+# image and the bed drives the running cluster.
+#
+# The venue is a disposable pod built from the image under review; its container
+# and its input volume are torn down with it.
+#
+# This bed deliberately does NOT claim the containerd substrate: in the pinned
+# toolchain a `pod:` deploy's authored `engine:` selector is dropped by the
+# check-bed `config`/`start` path (`charly config` emits a podman quadlet) and
+# `charly deploy add --engine` is an unknown flag (opencharly/charly#1109). What
+# it proves is this image's OWN running contract on a disposable pod — the same
+# scope its three sibling beds claim. It also does not claim the
+# Docker-compatible socket (opencharly/pod-crabbox-nested#1).
+#
+# Three steps, in the order that makes the bed a gate rather than a snapshot:
+#   1. ABSENCE  — reset the k3s state, then prove k3s is NOT serving (unit
+#                 inactive, no process, no kubeconfig, nothing on 6443, the
+#                 image's own readiness hook cannot pass) while the lease still
+#                 REFUSES the freshly generated key. The instruments are asserted
+#                 to exist first, so their silence is a measurement.
+#   2. PERFORM  — write the read-only lease inputs temp + mv and restart the
+#                 image's own `crabbox-bootstrap.service`; start the inner
+#                 containerd the k3s config names (K3S.md §2.3); start the
+#                 image's own `k3s-dummy.service` and `k3s.service`; then poll
+#                 the image's own readiness hook — the documented consumer
+#                 contract — to exit 0.
+#   3. PRESENCE — the node is Ready in the apiserver's own terms, the node's
+#                 runtime is the inner containerd, and a workload SCHEDULES onto
+#                 this node, gets an address from k3s's cluster CIDR, execs
+#                 through apiserver -> kubelet, and is visible as a sandbox in
+#                 the inner containerd. The lease contract still holds over SSH
+#                 as `crabbox` on 2222, ending in the readiness hook's own
+#                 reported duration.
+#
+# The plan runs at every check-live pass, including the fresh-rebuild pass, so
+# step 1 resets and step 2 re-applies: each pass measures its OWN perform.
+# =============================================================================
+check-pod-crabbox-k3s-cluster:
+    pod:
+        image: pod-crabbox-k3s
+        disposable: true
+        lifecycle: test
+        description: >-
+            R10 witness for the pod-crabbox-k3s control-plane lease image: a
+            disposable container built from the image boots systemd as PID 1,
+            and the bed drives the cluster in three steps — ABSENCE (k3s is not
+            serving: the unit is inactive, no process survives the reset, no
+            kubeconfig exists, nothing listens on 6443, the image's own readiness
+            hook cannot pass, and the lease refuses the freshly generated key),
+            PERFORM (the lease unit consumes authorized_keys, lease.env and
+            bootstrap.sh; the inner containerd the k3s config names is started;
+            the image's own k3s-dummy.service creates the stable node address and
+            k3s.service starts the control plane; the readiness hook is polled to
+            exit 0 as the consumer does), and PRESENCE (the node is Ready, its
+            runtime is the inner containerd, and a workload schedules onto this
+            node, receives a cluster-CIDR address, execs through apiserver ->
+            kubelet, and appears as a sandbox in the inner containerd; the lease
+            still holds over SSH as `crabbox` on 2222 with passwordless sudo and
+            the readiness hook's reported duration). A k3s that starts but never
+            becomes workload-usable fails the presence step, which is the whole
+            point: a Ready node is not a usable node. The containerd LEASE
+            venue, the Docker-compatible socket (issue #1) and the §5 PVC /
+            snapshot legs are explicitly not claimed.
+        volume:
+            - name: lease-inputs
+              type: volume
+              path: /crabbox
+        plan:
+            - check: absence — k3s is not serving, no kubeconfig exists, the readiness hook cannot pass, and the lease refuses the freshly generated key
+              id: k3s-cluster-absent-before-perform
+              context:
+                - runtime
+              timeout: 300s
+              command:
+                  command: |
+                      set -euo pipefail
+                      # The instruments must exist before their silence means anything.
+                      test -x /usr/local/bin/k3s
+                      test -x /usr/local/bin/kubectl
+                      test -x /usr/local/bin/crictl
+                      test -x /usr/local/libexec/crabbox/ready
+                      # Reset whatever an earlier pass left behind: the plan runs at
+                      # every check-live pass, and after `charly update` the container
+                      # is rebuilt. The bed must measure its OWN perform, never a
+                      # leftover one.
+                      systemctl stop k3s.service
+                      systemctl stop k3s-dummy.service
+                      rm -rf /var/lib/rancher/k3s /var/lib/kubelet /run/k3s
+                      rm -f /etc/rancher/k3s/k3s.yaml
+                      if ip link show k3s0 >/dev/null 2>&1; then
+                        ip link del k3s0
+                      fi
+                      rm -f /crabbox/authorized_keys /crabbox/lease.env /crabbox/bootstrap.sh
+                      rm -rf /home/crabbox/.ssh
+                      rm -f /var/lib/crabbox/bootstrapped /var/lib/crabbox/lease.env /var/lib/crabbox/bootstrap-marker
+                      rm -f /tmp/crabbox-lease-key /tmp/crabbox-lease-key.pub
+                      ssh-keygen -q -t ed25519 -N '' -f /tmp/crabbox-lease-key
+                      # ABSENCE of the cluster: the unit is inactive, no process
+                      # survives the reset, no kubeconfig was written, nothing
+                      # listens on the apiserver port, and the stable node address
+                      # link is gone.
+                      if systemctl is-active --quiet k3s.service; then
+                        echo "FAIL: k3s.service is still active before the perform" >&2
+                        exit 1
+                      fi
+                      if pgrep -x k3s >/dev/null; then
+                        echo "FAIL: a k3s process survives the reset" >&2
+                        exit 1
+                      fi
+                      test ! -e /etc/rancher/k3s/k3s.yaml
+                      if ss -ltn 'sport = :6443' | grep -q LISTEN; then
+                        echo "FAIL: something listens on 6443 before the perform" >&2
+                        exit 1
+                      fi
+                      test ! -e /sys/class/net/k3s0
+                      # ABSENCE of the lease contract: no authorized_keys are applied
+                      # and the fresh key is refused by AUTHENTICATION. A venue that
+                      # does not answer fails this step instead of reading as "not
+                      # applied yet".
+                      systemctl start sshd.service
+                      systemctl is-active --quiet sshd.service
+                      out=$(ssh -p 2222 -i /tmp/crabbox-lease-key \
+                        -o BatchMode=yes -o StrictHostKeyChecking=no \
+                        -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+                        crabbox@127.0.0.1 true 2>&1 || true)
+                      case "$out" in
+                        *"Permission denied (publickey"*) ;;
+                        *)
+                          printf '%s\n' "$out" >&2
+                          echo "FAIL: expected the lease to refuse the key over SSH; a venue that does not answer cannot prove the absence" >&2
+                          exit 1
+                          ;;
+                      esac
+                      test ! -e /home/crabbox/.ssh/authorized_keys
+                      # The image's OWN readiness hook is the contract. With SSH
+                      # answering and no kubeconfig, it must fail at the k3s half;
+                      # a hook that passes with no cluster proves nothing about
+                      # the perform.
+                      if /usr/local/libexec/crabbox/ready >/tmp/k3s-ready-absent.out 2>&1; then
+                        cat /tmp/k3s-ready-absent.out >&2
+                        echo "FAIL: the image's readiness hook passed before the perform" >&2
+                        exit 1
+                      fi
+                      grep -q 'k3s has not written' /tmp/k3s-ready-absent.out
+                      printf 'readiness hook absent: %s\n' "$(sed -n '1p' /tmp/k3s-ready-absent.out)"
+                      echo "ABSENT: k3s is not serving, the readiness hook cannot pass, and the lease refuses the key"
+                  in_container: true
+            - check: perform — the lease unit consumes the inputs, and the image's own units start the inner engine, the node address and k3s
+              id: k3s-cluster-performs-the-start
+              context:
+                - runtime
+              timeout: 1200s
+              command:
+                  command: |
+                      set -euo pipefail
+                      install -d -m 0755 /crabbox
+                      # The consumer writes each input TEMP + mv; the bootstrap reads
+                      # each one ONCE. Write the same way, so the bed exercises the
+                      # contract's own input path rather than an in-place rewrite it
+                      # forbids.
+                      install -m 0644 /tmp/crabbox-lease-key.pub /crabbox/.authorized_keys.tmp
+                      printf 'crabbox_bed_nonce=%s\n' charly-pod-crabbox-k3s-bed > /crabbox/.lease.env.tmp
+                      printf '#!/bin/bash\nset -euo pipefail\nprintf "%%s\\n" "$crabbox_bed_nonce" > /var/lib/crabbox/bootstrap-marker\n' > /crabbox/.bootstrap.sh.tmp
+                      chmod 0755 /crabbox/.bootstrap.sh.tmp
+                      mv /crabbox/.authorized_keys.tmp /crabbox/authorized_keys
+                      mv /crabbox/.lease.env.tmp /crabbox/lease.env
+                      mv /crabbox/.bootstrap.sh.tmp /crabbox/bootstrap.sh
+                      # The UNIT, not a hand-run copy of the script, consumes them.
+                      systemctl restart crabbox-bootstrap.service
+                      systemctl is-active --quiet crabbox-bootstrap.service
+                      test -f /var/lib/crabbox/bootstrapped
+                      # K3S.md §2.3: the engine k3s is configured to use must be up
+                      # before k3s starts. The image's own unit is idempotent and its
+                      # ExecStartPre resets the start-limit counter.
+                      systemctl start containerd.service
+                      systemctl is-active --quiet containerd.service
+                      test -S /run/containerd/containerd.sock
+                      # The stable node address the config binds (node-ip) and the
+                      # TLS SAN names. The image's own oneshot creates it.
+                      if ! systemctl start k3s-dummy.service; then
+                        systemctl status k3s-dummy.service --no-pager >&2 || true
+                        journalctl -u k3s-dummy.service --no-pager -n 30 >&2 || true
+                        if ! grep -q '^dummy ' /proc/modules; then
+                          echo "FAIL: k3s-dummy.service could not create k3s0 because the HOST has no dummy module loaded; a rootless lease cannot modprobe (README: the host must load it)" >&2
+                        fi
+                        exit 1
+                      fi
+                      systemctl is-active --quiet k3s-dummy.service
+                      ip -4 addr show dev k3s0 | grep -q '172.31.255.1/32'
+                      # k3s itself, through the image's own unit. Type=notify, so
+                      # start returns once k3s has reported ready.
+                      systemctl start k3s.service
+                      systemctl is-active --quiet k3s.service
+                      test -s /etc/rancher/k3s/k3s.yaml
+                      # The image's own readiness hook is the documented consumer
+                      # contract (CONTAINERD-IMAGES.md §2.1): after SSH answers, the
+                      # consumer POLLS the hook until it exits 0 or the readiness
+                      # timeout expires. Poll the same way, with an explicit
+                      # deadline, so a cluster that is not workload-usable yet is
+                      # waited for rather than declared ready.
+                      deadline=$(( $(date +%s) + 900 ))
+                      while :; do
+                        if /usr/local/libexec/crabbox/ready; then
+                          break
+                        fi
+                        if [ "$(date +%s)" -ge "${deadline}" ]; then
+                          echo "FAIL: the image's readiness hook did not exit 0 within 900s" >&2
+                          exit 1
+                        fi
+                        sleep 5
+                      done
+                      echo "PERFORMED: the lease unit applied the inputs, the inner engine is up, k3s0 carries the node address, k3s.service started, and the readiness hook exited 0"
+                  in_container: true
+            - check: presence — the node is Ready, a workload schedules and execs through apiserver to kubelet in the inner containerd, and the lease holds over SSH
+              id: k3s-cluster-present-and-workload-execs
+              context:
+                - runtime
+              timeout: 600s
+              command:
+                  command: |
+                      set -euo pipefail
+                      test "$(ps -p 1 -o comm=)" = systemd
+                      systemctl is-enabled --quiet k3s.service
+                      systemctl is-enabled --quiet k3s-dummy.service
+                      systemctl is-enabled --quiet containerd.service
+                      systemctl is-active --quiet k3s.service
+                      systemctl is-active --quiet containerd.service
+                      systemctl is-active --quiet sshd.service
+                      systemctl is-active --quiet crabbox-bootstrap.service
+                      ip -4 addr show dev k3s0 | grep -q '172.31.255.1/32'
+                      kubeconfig=/etc/rancher/k3s/k3s.yaml
+                      test -s "${kubeconfig}"
+                      # The apiserver is k3s's own, in its own reported version.
+                      apiserver=$(kubectl --kubeconfig "${kubeconfig}" get --raw /version)
+                      printf 'apiserver: %s\n' "${apiserver}"
+                      printf '%s\n' "${apiserver}" | grep -q '+k3s'
+                      # The node is Ready in the APISERVER's terms, not a unit's.
+                      nodes=$(kubectl --kubeconfig "${kubeconfig}" get nodes --no-headers)
+                      printf '%s\n' "${nodes}"
+                      printf '%s\n' "${nodes}" | grep -Eq ' Ready( |$)'
+                      node=$(kubectl --kubeconfig "${kubeconfig}" get nodes -o jsonpath='{.items[0].metadata.name}')
+                      test -n "${node}"
+                      # The node runs on the INNER containerd this image configures.
+                      runtime=$(kubectl --kubeconfig "${kubeconfig}" get node "${node}" -o jsonpath='{.status.nodeInfo.containerRuntimeVersion}')
+                      printf 'node runtime: %s\n' "${runtime}"
+                      printf '%s\n' "${runtime}" | grep -q '^containerd://'
+                      # A workload that only a working cluster can produce: it is
+                      # scheduled onto this node, gets an address from k3s's own
+                      # cluster CIDR, and its identity is the POD's.
+                      probe="crabbox-bed-$(date +%s)"
+                      cleanup() {
+                        kubectl --kubeconfig "${kubeconfig}" delete pod "${probe}" \
+                          --ignore-not-found --wait=false >/dev/null 2>&1 || true
+                      }
+                      trap cleanup EXIT
+                      kubectl --kubeconfig "${kubeconfig}" run "${probe}" \
+                        --image=alpine:3.21 --image-pull-policy=IfNotPresent \
+                        --restart=Never -- sleep 300 >/dev/null
+                      kubectl --kubeconfig "${kubeconfig}" wait \
+                        --for=condition=Ready "pod/${probe}" --timeout=300s >/dev/null
+                      scheduled=$(kubectl --kubeconfig "${kubeconfig}" get pod "${probe}" -o jsonpath='{.spec.nodeName}')
+                      test "${scheduled}" = "${node}"
+                      pod_ip=$(kubectl --kubeconfig "${kubeconfig}" get pod "${probe}" -o jsonpath='{.status.podIP}')
+                      printf 'workload pod IP: %s\n' "${pod_ip}"
+                      case "${pod_ip}" in
+                        10.42.*) ;;
+                        *)
+                          echo "FAIL: the workload address is not from k3s's cluster CIDR" >&2
+                          exit 1
+                          ;;
+                      esac
+                      # The exec path is apiserver -> kubelet -> CRI. The pod's
+                      # hostname is the pod name, which the apiserver/kubelet gives
+                      # it; the lease's own hostname is a different, random name.
+                      pod_hostname=$(kubectl --kubeconfig "${kubeconfig}" exec "${probe}" -- hostname)
+                      printf 'workload hostname: %s (lease hostname: %s)\n' "${pod_hostname}" "$(hostname)"
+                      test "${pod_hostname}" = "${probe}"
+                      test "${pod_hostname}" != "$(hostname)"
+                      # The SAME workload is a sandbox in the inner containerd that
+                      # k3s is configured to use, not in a second engine.
+                      sandboxes=$(crictl --runtime-endpoint unix:///run/containerd/containerd.sock pods --name "${probe}")
+                      printf '%s\n' "${sandboxes}"
+                      printf '%s\n' "${sandboxes}" | grep -q "${probe}"
+                      cleanup
+                      trap - EXIT
+                      # The lease contract's own SSH path, as the contract user,
+                      # ending in the hook's reported duration.
+                      out=$(ssh -p 2222 -i /tmp/crabbox-lease-key \
+                        -o BatchMode=yes -o StrictHostKeyChecking=no \
+                        -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+                        crabbox@127.0.0.1 \
+                        'id -un && sudo -n true && echo SUDO_OK && /usr/local/libexec/crabbox/ready')
+                      printf '%s\n' "${out}"
+                      printf '%s\n' "${out}" | grep -qx crabbox
+                      printf '%s\n' "${out}" | grep -qx SUDO_OK
+                      printf '%s\n' "${out}" | grep -Eq '^ready in [0-9]+s$'
+                      # The perform pass's own lease work.
+                      test -f /var/lib/crabbox/bootstrapped
+                      marker=$(tr -d '\n' < /var/lib/crabbox/bootstrap-marker)
+                      test "${marker}" = charly-pod-crabbox-k3s-bed
+                      echo "PRESENT: the node is Ready, a workload scheduled and execs through apiserver -> kubelet in the inner containerd, and the lease holds over SSH with the readiness hook's reported duration"
+                  in_container: true
