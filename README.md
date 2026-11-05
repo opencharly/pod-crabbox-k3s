@@ -70,10 +70,31 @@ scp -P 2222 crabbox@<lease>:/etc/rancher/k3s/k3s.yaml ~/.kube/config
   pulled on demand. The readiness hook's workload probe pulls `alpine:3.21`, so
   it fails honestly (and the consumer reports the elapsed time) when the lease
   has no egress.
-- **Rootless needs the host's `dummy` module.** `k3s-dummy.service` runs
-  `ip link add k3s0 type dummy` inside the lease. A rootless lease runs as
-  namespace-root with `CAP_NET_ADMIN` in its own user namespace, but it cannot
-  `modprobe`: the host must already have the `dummy` module loaded.
+- **The lease needs the host's `dummy` module.** `k3s-dummy.service` runs
+  `ip link add k3s0 type dummy` inside the lease, and a container cannot
+  `modprobe`: the host must already have the `dummy` module loaded. A rootless
+  lease runs as namespace-root in its own user namespace, but that does **not**
+  by itself carry `CAP_NET_ADMIN` into the container — see the next point.
+- **The lease needs `NET_ADMIN` and `SYS_ADMIN`.** podman's default capability
+  set includes neither. Without `NET_ADMIN` the `k3s0` link cannot be created
+  (`RTNETLINK answers: Operation not permitted`), and `k3s.service` then fails
+  with result `dependency` — which reads like a k3s defect and is not one.
+  With `NET_ADMIN` but without `SYS_ADMIN`, kubelet dies at
+  `error configuring root directory: failed to bind-mount /var/lib/kubelet:
+  operation not permitted`. A consumer therefore declares:
+
+  ```yaml
+  security:
+      cap_add:
+          - NET_ADMIN
+          - SYS_ADMIN
+  ```
+
+- **The host must delegate the `cpuset` cgroup v2 controller into the user
+  slice subtree.** Without it k3s exits with
+  `level=fatal msg="Error: failed to find cpuset cgroup (v2)"`. On this host
+  `user.slice` has `cpuset` available but `cgroup.subtree_control` carries only
+  `cpu memory pids`; a `Delegate=` drop-in does not add it.
 - **No `ExecStartPre=modprobe`.** The unit deliberately starts no kernel module;
   the modules k3s needs (`br_netfilter`, `overlay`, `nf_conntrack`) are the
   host's responsibility (CONTAINERD-IMAGES.md §2).
