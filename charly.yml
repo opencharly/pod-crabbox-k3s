@@ -43,7 +43,7 @@ pod-crabbox-k3s:
             that also proves the node is `Ready` and that a workload execs through
             apiserver → kubelet (CONTAINERD-IMAGES.md §2.1). Run it with
             `--device /dev/kmsg`.
-        base: ghcr.io/opencharly/pod-crabbox-nested:2026.309.0149
+        base: ghcr.io/opencharly/pod-crabbox-nested:2026.309.0812
         # An OCI base does not inherit the parent's distro/build values, so the
         # CachyOS chain is declared here; the base image is itself CachyOS.
         distro:
