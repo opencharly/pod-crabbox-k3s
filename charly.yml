@@ -183,6 +183,13 @@ check-pod-crabbox-k3s-cluster:
                       # leftover one.
                       systemctl stop k3s.service
                       systemctl stop k3s-dummy.service
+                      # A just-stopped kubelet leaves bind-mounts under
+                      # /var/lib/kubelet, and a MOUNT POINT cannot be removed —
+                      # `rm -rf` answers "Device or resource busy". Unmount first;
+                      # this is what the SYS_ADMIN the bed declares is for.
+                      if grep -q ' /var/lib/kubelet ' /proc/self/mountinfo; then
+                        umount -R /var/lib/kubelet
+                      fi
                       rm -rf /var/lib/rancher/k3s /var/lib/kubelet /run/k3s
                       rm -f /etc/rancher/k3s/k3s.yaml
                       if ip link show k3s0 >/dev/null 2>&1; then
