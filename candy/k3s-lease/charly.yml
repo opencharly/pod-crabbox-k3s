@@ -1,0 +1,529 @@
+# k3s-lease — the k3s control plane added by `pod-crabbox-k3s` on top of the
+# `pod-crabbox-nested` lease contract.
+#
+# Sources:
+#   - CONTAINERD-IMAGES.md §2, the `pod-crabbox-k3s` row: the packages, the
+#     `write-kubeconfig-mode`, the `tls-san` naming the stable node address, the
+#     `config.yaml.d/` `node-ip` drop-in (plus the `KubeletInUserNamespace`
+#     gate for rootless), `k3s-dummy.service`, the `KillMode=process` /
+#     `Delegate=yes` / `Restart=always` unit with NO `ExecStartPre=modprobe`, and
+#     the `--device /dev/kmsg` runtime flag.
+#   - CONTAINERD-IMAGES.md §2.1: the k3s images MUST ship a readiness hook that
+#     checks BOTH a Ready node AND a workload exec through apiserver → kubelet.
+#   - K3S.md §1–§2: k3s points at the ONE shared containerd
+#     (`container-runtime-endpoint`), and the containerd CRI config needs the two
+#     k3s CNI directory keys (without them pods start but have no network).
+#   - opencharly/layer-k3s's `k3s` candy: the pinned version
+#     (`v1.37.0+k3s1`), the sha256-verified multi-call install, the
+#     `kubectl`/`crictl`/`ctr` symlinks, and the runtime package list
+#     (`conntrack-tools`, `socat`, `ethtool`, `ca-certificates`,
+#     `fuse-overlayfs`; `iptables-nft` is provided by the base image's
+#     `iptables` package and is asserted instead of re-declared).
+#   - opencharly/pod-crabbox-nested for the pinned-release download pattern and
+#     the inherited-lease-contract probes this candy repeats at its own boundary.
+k3s-lease:
+    candy:
+        description: |
+            The k3s control plane for a CachyOS Crabbox lease. Installs the pinned,
+            sha256-verified k3s multi-call binary at `/usr/local/bin/k3s` with
+            `kubectl`/`crictl`/`ctr` symlinks, plus its runtime dependencies
+            (`sqlite`, `procps-ng`, `kmod`, `iputils`, `conntrack-tools`, `socat`,
+            `ethtool`, `fuse-overlayfs`). Points k3s at the inner containerd the
+            nested image runs (`container-runtime-endpoint`, K3S.md §2.2) and gives
+            that daemon the two k3s CNI directory keys through
+            `/etc/containerd/conf.d/50-k3s-cni.toml` (K3S.md §2.1). Writes
+            `/etc/rancher/k3s/config.yaml` (`write-kubeconfig-mode: "0644"`,
+            `tls-san: 172.31.255.1`) and a `config.yaml.d/10-crabbox.yaml` drop-in
+            (`node-ip: 172.31.255.1`, the `KubeletInUserNamespace` feature gate).
+            `k3s-dummy.service` idempotently creates the `k3s0` dummy link that
+            carries the node address; `k3s.service` runs with `KillMode=process`,
+            `Delegate=yes`, `Restart=always` and no module-loading pre-start. The
+            inherited readiness hook is replaced with one that additionally requires
+            a Ready node and a workload exec through apiserver → kubelet.
+        var:
+            # The pinned k3s release, from opencharly/layer-k3s's own `k3s` candy.
+            # The URL spelling needs the `+` percent-encoded.
+            K3S_VERSION: "v1.37.0+k3s1"
+            K3S_VERSION_URL: "v1.37.0%2Bk3s1"
+            # The provider's stable node address (crabbox/docs/providers/containerd.md
+            # `nodeAddress`, default 172.31.255.1/32).
+            K3S_NODE_IP: "172.31.255.1"
+        # The lease SSH port is the base image's own contract. An OCI base does not
+        # carry its candy chain's ports across the boundary, so the published number
+        # is restated here (one number, taken from the base image's label).
+        port:
+            - 2222
+        distro:
+            arch:
+                package:
+                    # CONTAINERD-IMAGES.md §2, the `pod-crabbox-k3s` row. The
+                    # packages are already present in the CachyOS base image where
+                    # the row's list overlaps the base; declaring them keeps the
+                    # image correct if a later base stops pulling them in.
+                    - sqlite
+                    - procps-ng
+                    - kmod
+                    - iputils
+                    # opencharly/layer-k3s `k3s` candy: the runtime dependencies
+                    # k3s needs for networking and its datastore. `iptables-nft` is
+                    # provided by the base image's `iptables` package (asserted
+                    # below, never re-declared over a package-owned file).
+                    - conntrack-tools
+                    - socat
+                    - ethtool
+                    - fuse-overlayfs
+                    - ca-certificates
+        plan:
+            # ------------------------------------------------------------------
+            # The pinned k3s binary: downloaded, checksum-verified, installed.
+            # ------------------------------------------------------------------
+            - run: download the pinned k3s multi-call binary
+              id: k3s-binary-download
+              download: "https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION_URL}/k3s"
+              extract: none
+              to: /usr/local/bin/k3s
+              mode: "0755"
+              run_as: root
+            - run: download the release sha256 manifest for this architecture
+              id: k3s-checksum-download
+              download: "https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION_URL}/sha256sum-${ARCH}.txt"
+              extract: none
+              to: /usr/share/k3s/sha256sum.txt
+              mode: "0644"
+              run_as: root
+            # k3s is multi-call and dispatches on argv[0].
+            - run: point kubectl at the k3s multi-call binary
+              link: /usr/local/bin/kubectl
+              target: /usr/local/bin/k3s
+              run_as: root
+            - run: point crictl at the k3s multi-call binary
+              link: /usr/local/bin/crictl
+              target: /usr/local/bin/k3s
+              run_as: root
+            - run: point ctr at the k3s multi-call binary
+              link: /usr/local/bin/ctr
+              target: /usr/local/bin/k3s
+              run_as: root
+            # ------------------------------------------------------------------
+            # k3s configuration: the shared inner containerd, the stable node
+            # address, and the rootless kubelet gate.
+            # ------------------------------------------------------------------
+            - run: create the k3s configuration directory
+              mkdir: /etc/rancher/k3s
+              run_as: root
+              mode: "0755"
+            - run: write the k3s server config
+              id: k3s-config
+              write: /etc/rancher/k3s/config.yaml
+              run_as: root
+              mode: "0644"
+              content: |
+                # Managed by the opencharly pod-crabbox-k3s candy.
+                #
+                # K3S.md §1–§2.2: k3s uses the ONE inner containerd the nested
+                # image already runs, never a second embedded daemon. The socket
+                # belongs to that daemon (nerdctl-full's containerd.service).
+                container-runtime-endpoint: unix:///run/containerd/containerd.sock
+                # CONTAINERD-IMAGES.md §2, the pod-crabbox-k3s row: the consumer
+                # reads the kubeconfig over SSH as the `crabbox` login user.
+                write-kubeconfig-mode: "0644"
+                # The provider's stable node address
+                # (crabbox/docs/providers/containerd.md `nodeAddress`,
+                # 172.31.255.1/32), so a certificate served for it validates.
+                tls-san:
+                  - 172.31.255.1
+            - run: create the k3s config drop-in directory
+              mkdir: /etc/rancher/k3s/config.yaml.d
+              run_as: root
+              mode: "0755"
+            - run: write the node-ip and rootless-kubelet drop-in
+              id: k3s-config-dropin
+              write: /etc/rancher/k3s/config.yaml.d/10-crabbox.yaml
+              run_as: root
+              mode: "0644"
+              content: |
+                # Managed by the opencharly pod-crabbox-k3s candy.
+                #
+                # CONTAINERD-IMAGES.md §2, the pod-crabbox-k3s row: k3s binds its
+                # node address to the stable lease address, carried by the k3s0
+                # dummy link k3s-dummy.service creates, rather than to whatever
+                # address the outer bridge happens to hand out.
+                node-ip: 172.31.255.1
+                # The same row's rootless gate: the kubelet runs in a user
+                # namespace when the outer lease is rootless, and Kubernetes
+                # refuses to admit that without the KubeletInUserNamespace gate.
+                kubelet-arg:
+                  - feature-gates=KubeletInUserNamespace=true
+            # ------------------------------------------------------------------
+            # containerd CRI: the two k3s CNI directory keys (K3S.md §2.1).
+            # ------------------------------------------------------------------
+            - run: create the containerd conf.d directory
+              mkdir: /etc/containerd/conf.d
+              run_as: root
+              mode: "0755"
+            - run: give the inner containerd the k3s CNI binary and config directories
+              id: k3s-containerd-cni
+              write: /etc/containerd/conf.d/50-k3s-cni.toml
+              run_as: root
+              mode: "0644"
+              content: |
+                # Managed by the opencharly pod-crabbox-k3s candy.
+                #
+                # K3S.md §2.1: k3s writes its flannel conflist and CNI binaries
+                # under its own data directory, which stock containerd does not
+                # read. Without these two keys pods start but have no network.
+                # This is a PARTIAL config imported by the inner daemon's
+                # version-4 config (`imports = ["/etc/containerd/conf.d/*.toml"]`).
+                [plugins.'io.containerd.cri.v1.runtime'.cni]
+                  bin_dirs = ['/var/lib/rancher/k3s/data/current/bin']
+                  conf_dir = '/var/lib/rancher/k3s/agent/etc/cni/net.d'
+            # ------------------------------------------------------------------
+            # k3s-dummy.service: the stable node address link.
+            # ------------------------------------------------------------------
+            - run: write the idempotent k3s0 link script
+              id: k3s-dummy-script
+              write: /usr/local/libexec/crabbox/k3s-dummy.sh
+              run_as: root
+              mode: "0755"
+              content: |
+                #!/bin/bash
+                # Managed by the opencharly pod-crabbox-k3s candy.
+                #
+                # CONTAINERD-IMAGES.md §2, the pod-crabbox-k3s row: k3s needs a
+                # stable node address. A dummy link carries the provider's
+                # 172.31.255.1/32, so the address exists before k3s binds it.
+                # Every operation is idempotent: a restarted lease reuses the link
+                # and replaces the address instead of failing on a duplicate.
+                set -euo pipefail
+                if ! ip link show k3s0 >/dev/null 2>&1; then
+                    ip link add k3s0 type dummy
+                fi
+                ip link set k3s0 up
+                ip addr replace 172.31.255.1/32 dev k3s0
+            - run: write the k3s0 dummy-link unit
+              id: k3s-dummy-unit
+              write: /etc/systemd/system/k3s-dummy.service
+              run_as: root
+              mode: "0644"
+              content: |
+                # Managed by the opencharly pod-crabbox-k3s candy.
+                #
+                # CONTAINERD-IMAGES.md §2, the pod-crabbox-k3s row.
+                [Unit]
+                Description=Crabbox k3s stable node address (k3s0)
+                After=network.target
+                Before=k3s.service
+
+                [Service]
+                Type=oneshot
+                RemainAfterExit=yes
+                ExecStart=/usr/local/libexec/crabbox/k3s-dummy.sh
+
+                [Install]
+                WantedBy=multi-user.target
+            # ------------------------------------------------------------------
+            # k3s.service: process-only kill mode, delegated cgroup, no modprobe.
+            # ------------------------------------------------------------------
+            - run: write the k3s service unit
+              id: k3s-unit
+              write: /etc/systemd/system/k3s.service
+              run_as: root
+              mode: "0644"
+              content: |
+                # Managed by the opencharly pod-crabbox-k3s candy.
+                #
+                # CONTAINERD-IMAGES.md §2, the pod-crabbox-k3s row: KillMode=process
+                # so a k3s restart never kills the containers it supervises;
+                # Delegate=yes so cgroup controllers are delegated to k3s; and NO
+                # `ExecStartPre=modprobe` — the modules k3s needs are the host's
+                # business and must not be loaded from inside the lease.
+                [Unit]
+                Description=Lightweight Kubernetes
+                Documentation=https://k3s.io
+                Wants=network-online.target containerd.service
+                After=network-online.target containerd.service k3s-dummy.service
+                Requires=k3s-dummy.service
+
+                [Install]
+                WantedBy=multi-user.target
+
+                [Service]
+                Type=notify
+                KillMode=process
+                Delegate=yes
+                # Non-zero rlimits cause kernel accounting overhead; use cgroups.
+                LimitNOFILE=1048576
+                LimitNPROC=infinity
+                LimitCORE=infinity
+                TasksMax=infinity
+                TimeoutStartSec=0
+                Restart=always
+                RestartSec=5s
+                ExecStart=/usr/local/bin/k3s server
+            - run: create the systemd wants directory
+              mkdir: /etc/systemd/system/multi-user.target.wants
+              run_as: root
+              mode: "0755"
+            - run: enable k3s-dummy.service at boot
+              link: /etc/systemd/system/multi-user.target.wants/k3s-dummy.service
+              target: /etc/systemd/system/k3s-dummy.service
+              run_as: root
+            - run: enable k3s.service at boot
+              link: /etc/systemd/system/multi-user.target.wants/k3s.service
+              target: /etc/systemd/system/k3s.service
+              run_as: root
+            # ------------------------------------------------------------------
+            # The readiness hook: a Ready node AND a workload exec.
+            # ------------------------------------------------------------------
+            - run: replace the inherited readiness hook with the k3s readiness hook
+              id: k3s-ready-hook
+              write: /usr/local/libexec/crabbox/ready
+              run_as: root
+              mode: "0755"
+              content: |
+                #!/bin/bash
+                # Managed by the opencharly pod-crabbox-k3s candy.
+                #
+                # CONTAINERD-IMAGES.md §2.1: SSH readiness is not lease readiness.
+                # The k3s images MUST check BOTH (1) the node is Ready and (2) a
+                # workload execs through apiserver -> kubelet. Checking only (1) is
+                # wrong: a clone carries /var but not /run, so a fork reports Ready
+                # about 8 s before it is workload-usable (the kubelet rebuilds every
+                # CRI sandbox and host-local issues fresh IPs).
+                #
+                # The inherited lease checks are kept unchanged below; the k3s checks
+                # run after them. The hook reports the elapsed time, not a bare
+                # pass/fail, and it is idempotent: the probe pod is removed whether
+                # the exec succeeded or not.
+                set -euo pipefail
+                started="$(date +%s)"
+
+                # --- the inherited lease contract ---
+                getent passwd crabbox >/dev/null
+                if [ "$(id -un)" = crabbox ]; then
+                    sudo -n true
+                fi
+                ss -ltn 'sport = :2222' | grep -q LISTEN
+                if [ -e /crabbox/authorized_keys ] || [ -e /crabbox/lease.env ]; then
+                    [ -f /var/lib/crabbox/bootstrapped ]
+                fi
+
+                # --- the k3s checks ---
+                kubeconfig=/etc/rancher/k3s/k3s.yaml
+                if [ ! -f "${kubeconfig}" ]; then
+                    echo "FAIL: k3s has not written ${kubeconfig}" >&2
+                    exit 1
+                fi
+                kubectl --kubeconfig "${kubeconfig}" get nodes >/dev/null
+                kubectl --kubeconfig "${kubeconfig}" get nodes --no-headers \
+                    | grep -q ' Ready'
+
+                probe="crabbox-ready-$(date +%s)"
+                cleanup() {
+                    kubectl --kubeconfig "${kubeconfig}" delete pod "${probe}" \
+                        --ignore-not-found --wait=false >/dev/null 2>&1 || true
+                }
+                trap cleanup EXIT
+                kubectl --kubeconfig "${kubeconfig}" run "${probe}" \
+                    --image=alpine:3.21 --image-pull-policy=IfNotPresent \
+                    --restart=Never -- sleep 300 >/dev/null
+                kubectl --kubeconfig "${kubeconfig}" wait \
+                    --for=condition=Ready "pod/${probe}" --timeout=180s >/dev/null
+                kubectl --kubeconfig "${kubeconfig}" exec "${probe}" -- true
+                cleanup
+                trap - EXIT
+
+                echo "ready in $(( $(date +%s) - started ))s"
+            # ------------------------------------------------------------------
+            # The k3s artifact surface, probed at THIS image's boundary.
+            # ------------------------------------------------------------------
+            - check: the verified k3s multi-call binary is installed at /usr/local/bin/k3s
+              id: k3s-binary
+              exit_status: 0
+              command: test -x /usr/local/bin/k3s
+            - check: the k3s binary is executable (mode 0755)
+              id: k3s-binary-mode
+              file:
+                file: /usr/local/bin/k3s
+                mode: "0755"
+            - check: the installed binary matches the release's published sha256
+              id: k3s-checksum
+              exit_status: 0
+              command: |
+                  expected="$(awk '$2 == "k3s" { print $1 }' /usr/share/k3s/sha256sum.txt)"
+                  actual="$(sha256sum /usr/local/bin/k3s | awk '{ print $1 }')"
+                  test -n "${expected}" && test "${expected}" = "${actual}"
+            - check: the binary reports a pinned k3s version
+              id: k3s-version
+              exit_status: 0
+              stdout:
+                  - contains: "k3s version v1."
+              command: /usr/local/bin/k3s --version
+            - check: kubectl dispatches through the k3s multi-call binary via a symlink
+              id: k3s-kubectl-symlink
+              exit_status: 0
+              command: test "$(readlink /usr/local/bin/kubectl)" = /usr/local/bin/k3s
+            - check: crictl dispatches through the same multi-call binary
+              id: k3s-crictl-symlink
+              exit_status: 0
+              command: test "$(readlink /usr/local/bin/crictl)" = /usr/local/bin/k3s
+            - check: ctr dispatches through the same multi-call binary
+              id: k3s-ctr-symlink
+              exit_status: 0
+              command: test "$(readlink /usr/local/bin/ctr)" = /usr/local/bin/k3s
+            - check: the k3s config points at the inner containerd socket
+              id: k3s-container-runtime-endpoint
+              exit_status: 0
+              command: >-
+                  grep -qx 'container-runtime-endpoint: unix:///run/containerd/containerd.sock' /etc/rancher/k3s/config.yaml
+            - check: the k3s config sets the world-readable kubeconfig mode
+              id: k3s-write-kubeconfig-mode
+              exit_status: 0
+              command: >-
+                  grep -qx 'write-kubeconfig-mode: "0644"' /etc/rancher/k3s/config.yaml
+            - check: the k3s config names the provider's stable node address as a TLS SAN
+              id: k3s-tls-san
+              exit_status: 0
+              command: grep -qx '  - 172.31.255.1' /etc/rancher/k3s/config.yaml
+            - check: the drop-in sets node-ip to the stable node address
+              id: k3s-node-ip
+              exit_status: 0
+              command: >-
+                  grep -qx 'node-ip: 172.31.255.1' /etc/rancher/k3s/config.yaml.d/10-crabbox.yaml
+            - check: the drop-in enables the KubeletInUserNamespace gate for rootless
+              id: k3s-kubelet-user-namespace
+              exit_status: 0
+              command: grep -qx '  - feature-gates=KubeletInUserNamespace=true' /etc/rancher/k3s/config.yaml.d/10-crabbox.yaml
+            - check: the inner containerd gets the k3s CNI binary directory
+              id: k3s-cni-bin-dirs
+              file:
+                file: /etc/containerd/conf.d/50-k3s-cni.toml
+                contains: "/var/lib/rancher/k3s/data/current/bin"
+            - check: the inner containerd gets the k3s CNI config directory
+              id: k3s-cni-conf-dir
+              file:
+                file: /etc/containerd/conf.d/50-k3s-cni.toml
+                contains: "/var/lib/rancher/k3s/agent/etc/cni/net.d"
+            - check: the k3s0 dummy-link script is installed and executable
+              id: k3s-dummy-script-installed
+              file:
+                file: /usr/local/libexec/crabbox/k3s-dummy.sh
+                mode: "0755"
+            - check: the dummy-link script creates k3s0 and assigns the stable address
+              id: k3s-dummy-script-body
+              exit_status: 0
+              command: >-
+                  grep -q 'ip link add k3s0 type dummy' /usr/local/libexec/crabbox/k3s-dummy.sh &&
+                  grep -q 'ip addr replace 172.31.255.1/32 dev k3s0' /usr/local/libexec/crabbox/k3s-dummy.sh
+            - check: k3s-dummy.service exists and runs the link script
+              id: k3s-dummy-unit-body
+              exit_status: 0
+              command: >-
+                  test -f /etc/systemd/system/k3s-dummy.service &&
+                  grep -qx 'ExecStart=/usr/local/libexec/crabbox/k3s-dummy.sh' /etc/systemd/system/k3s-dummy.service
+            - check: k3s-dummy.service is enabled at boot
+              id: k3s-dummy-enabled
+              exit_status: 0
+              command: test "$(readlink /etc/systemd/system/multi-user.target.wants/k3s-dummy.service)" = /etc/systemd/system/k3s-dummy.service
+            - check: the k3s unit uses KillMode=process
+              id: k3s-unit-killmode
+              exit_status: 0
+              command: grep -qx 'KillMode=process' /etc/systemd/system/k3s.service
+            - check: the k3s unit delegates cgroup controllers
+              id: k3s-unit-delegate
+              exit_status: 0
+              command: grep -qx 'Delegate=yes' /etc/systemd/system/k3s.service
+            - check: the k3s unit restarts always
+              id: k3s-unit-restart
+              exit_status: 0
+              command: grep -qx 'Restart=always' /etc/systemd/system/k3s.service
+            - check: the k3s unit starts no kernel module
+              id: k3s-unit-no-modprobe
+              exit_status: 0
+              command: sh -c 'test -f /etc/systemd/system/k3s.service && ! grep -Eq "^ExecStartPre=.*(modprobe|insmod)" /etc/systemd/system/k3s.service'
+            - check: k3s.service is enabled at boot
+              id: k3s-unit-enabled
+              exit_status: 0
+              command: test "$(readlink /etc/systemd/system/multi-user.target.wants/k3s.service)" = /etc/systemd/system/k3s.service
+            - check: the readiness hook is installed, executable and probes the cluster
+              id: k3s-ready-hook-installed
+              exit_status: 0
+              command: >-
+                  test -x /usr/local/libexec/crabbox/ready &&
+                  grep -q 'get nodes' /usr/local/libexec/crabbox/ready &&
+                  grep -q 'kubectl --kubeconfig "${kubeconfig}" exec' /usr/local/libexec/crabbox/ready
+            - check: conntrack-tools is installed for kube-proxy connection tracking
+              id: k3s-conntrack
+              package:
+                  package: conntrack-tools
+                  installed: true
+            - check: socat is installed for the k3s apiserver tunnel proxy
+              id: k3s-socat
+              package:
+                  package: socat
+                  installed: true
+            - check: ethtool is installed
+              id: k3s-ethtool
+              package:
+                  package: ethtool
+                  installed: true
+            - check: fuse-overlayfs is installed
+              id: k3s-fuse-overlayfs
+              package:
+                  package: fuse-overlayfs
+                  installed: true
+            - check: sqlite is installed for the k3s datastore
+              id: k3s-sqlite
+              package:
+                  package: sqlite
+                  installed: true
+            - check: procps-ng is installed
+              id: k3s-procps-ng
+              package:
+                  package: procps-ng
+                  installed: true
+            - check: kmod is installed
+              id: k3s-kmod
+              package:
+                  package: kmod
+                  installed: true
+            - check: iputils is installed
+              id: k3s-iputils
+              package:
+                  package: iputils
+                  installed: true
+            - check: iptables-nft and iproute2 are available to k3s
+              id: k3s-iptables-iproute
+              exit_status: 0
+              command: >-
+                  command -v iptables-nft &&
+                  command -v ip
+            # ------------------------------------------------------------------
+            # The inherited lease contract, probed at THIS image's boundary.
+            # ------------------------------------------------------------------
+            - check: /sbin/init resolves to the systemd binary, so the image can boot systemd as PID 1
+              id: k3s-systemd-init-binary
+              exit_status: 0
+              command: test "$(readlink -f /sbin/init)" = /usr/lib/systemd/systemd
+            - check: the inherited lease SSH contract is present (sshd, bootstrap, readiness hook)
+              id: k3s-lease-binaries
+              exit_status: 0
+              command: >-
+                  test -x /usr/sbin/sshd &&
+                  test -x /usr/local/libexec/crabbox/bootstrap.sh &&
+                  test -x /usr/local/libexec/crabbox/ready
+            - check: the inherited lease login user is crabbox at uid 1000
+              id: k3s-lease-user
+              exit_status: 0
+              command: >-
+                  test "$(getent passwd 1000 | cut -d: -f1)" = crabbox
+            - check: the inherited SSH drop-in names port 2222 and sshd parses it
+              id: k3s-lease-sshd
+              exit_status: 0
+              command: >-
+                  grep -qx 'Port 2222' /etc/ssh/sshd_config.d/99-crabbox.conf &&
+                  /usr/sbin/sshd -t
+            - check: the inherited inner containerd unit is enabled at boot
+              id: k3s-inner-containerd-enabled
+              exit_status: 0
+              command: test "$(readlink /etc/systemd/system/multi-user.target.wants/containerd.service)" = /usr/local/lib/systemd/system/containerd.service

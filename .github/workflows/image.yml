@@ -1,0 +1,72 @@
+# Image build/publish for this repo — the thin caller for the org's ONE reusable
+# (opencharly/.github/.github/workflows/image-build.yml, landed by opencharly/.github#275).
+#
+# THE REF IS THE REUSABLE'S MERGED `main` (`bd1e195cadfce40e09719d99a16f7353e1aa27bd`),
+# pinned by commit so a later `main` cannot change what this repo builds with. That is the
+# revision this repo's first `pull_request` run used (measured 2026-11-05).
+#
+# WHY THIS TRIGGERS ON `workflow_run`, NOT `push: tags`. It used to listen on
+# `push: tags: ['v*']` and it NEVER FIRED: `pod-crabbox` merged and tagged
+# (`v2026.307.1759` at `1b9a9c06`) and produced zero image runs — every `image` run on
+# record is `pull_request` (opencharly/.github#277). The reason is stated in the org's own
+# working workflow, `charly/.github/workflows/release-binary.yml`: tag-on-merge creates tags
+# via the REST API (`git.createRef`), which does NOT emit a push event, so a `push: tags`
+# listener cannot see them. `release-binary` chains off tag-on-merge COMPLETION instead —
+# "the ONE trigger whose event delivery is proven" — and this caller now does the same.
+#
+# WHAT EACH EVENT DOES:
+#   workflow_run (tag-on-merge completed, success) → build and PUBLISH the newest `v*` tag
+#     as its base image, so the image tag equals the git tag without the `v`.
+#   pull_request / workflow_dispatch → build only (push=false); the reusable derives its
+#     local `ci-<sha>` tag, which is the build-only proof it documents.
+#
+# The newest tag is selected with `sort -V`, never `sort -u`: CalVer components are not
+# zero-padded to a fixed width, so a lexical sort picks the wrong one.
+name: image
+
+on:
+  workflow_run:
+    workflows: ["tag-on-merge"]
+    types: [completed]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tag:
+    runs-on: ${{ vars.CI_DOCKER_RUNNER_LABEL || 'ubuntu-latest' }}
+    outputs:
+      tag: ${{ steps.newest.outputs.tag }}
+    steps:
+      - name: Resolve the tag to publish
+        id: newest
+        env:
+          EVENT: ${{ github.event_name }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Only a SUCCESSFUL tag-on-merge completion names a tag to publish. Every other
+          # event leaves this empty, which keeps the pull_request path exactly as it was.
+          if [ "${EVENT}" != "workflow_run" ] || [ "${CONCLUSION}" != "success" ]; then
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tag="$(git ls-remote --tags --refs "https://github.com/${REPO}" 'v*' \
+            | sed 's#.*refs/tags/##' | sort -V | tail -1)"
+          if [ -z "${tag}" ]; then
+            echo "::error::tag-on-merge reported success but ${REPO} serves no v* tag"
+            exit 1
+          fi
+          echo "tag=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "publishing ${REPO} at git tag ${tag} → image tag ${tag#v}"
+
+  image:
+    needs: tag
+    if: github.event_name != 'workflow_run' || needs.tag.outputs.tag != ''
+    uses: opencharly/.github/.github/workflows/image-build.yml@bd1e195cadfce40e09719d99a16f7353e1aa27bd
+    with:
+      tag: ${{ needs.tag.outputs.tag }}
+      push: ${{ github.event_name == 'workflow_run' }}
+    permissions:
+      contents: read
+      packages: write
