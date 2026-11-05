@@ -1,0 +1,63 @@
+# pod-crabbox-k3s — the k3s control-plane CachyOS lease image for the Crabbox
+# containerd provider.
+#
+# One repo per image (W5.2, opencharly/opencharly#869). The image imports the
+# nested lease image at a PINNED tag, so the image tag and the git tag name the
+# same build: ghcr.io/opencharly/pod-crabbox-k3s:<tag> is the tree tagged <tag>.
+repo: github.com/opencharly/pod-crabbox-k3s
+defaults:
+    platform:
+        - linux/amd64
+    tag: auto
+    registry: ghcr.io/opencharly
+    build:
+        - pac
+import: []
+discover:
+    - path: candy
+      recursive: true
+
+# The k3s variant. Everything about the lease contract (sshd on 2222, the
+# `crabbox` login user with passwordless sudo, the read-only `/crabbox` inputs,
+# the shared bootstrap, the readiness hook), systemd-as-PID-1 and the inner
+# containerd/krun stack are inherited from `pod-crabbox-nested`; this image adds
+# k3s and points it at that inner containerd.
+pod-crabbox-k3s:
+    candy:
+        description: |
+            The k3s control-plane CachyOS lease image for a Crabbox `containerd`
+            lease: the nested-engine `pod-crabbox-nested` contract plus the pinned
+            k3s multi-call binary at `/usr/local/bin/k3s` (with `kubectl`, `crictl`
+            and `ctr` symlinks), its runtime dependencies (`sqlite`, `procps-ng`,
+            `kmod`, `iputils`, `conntrack-tools`, `socat`, `ethtool`,
+            `fuse-overlayfs`). k3s uses the ONE inner containerd the nested image
+            already runs (`container-runtime-endpoint:
+            unix:///run/containerd/containerd.sock`, K3S.md §2.2) and is given the
+            two k3s-specific CNI directory keys through a `conf.d` drop-in
+            (K3S.md §2.1). A `config.yaml.d/` drop-in sets `node-ip: 172.31.255.1`
+            (the provider's stable node address) and the `KubeletInUserNamespace`
+            feature gate for a rootless outer. `k3s-dummy.service` creates the
+            `k3s0` dummy link that carries that address; `k3s.service` runs
+            `KillMode=process`, `Delegate=yes`, `Restart=always` and starts no
+            kernel module. The image replaces the inherited readiness hook with one
+            that also proves the node is `Ready` and that a workload execs through
+            apiserver → kubelet (CONTAINERD-IMAGES.md §2.1). Run it with
+            `--device /dev/kmsg`.
+        base: ghcr.io/opencharly/pod-crabbox-nested:2026.309.0149
+        # An OCI base does not inherit the parent's distro/build values, so the
+        # CachyOS chain is declared here; the base image is itself CachyOS.
+        distro:
+            - cachyos
+            - arch
+        # systemd refuses to run in system mode as a non-root PID 1, so the image
+        # ends at USER root exactly as the base image does; the LOGIN user stays
+        # `crabbox` (uid 1000), created by the inherited candy.
+        user: root
+        uid: 0
+        gid: 0
+        # systemd as PID 1, inherited from the nested image: crun/runc
+        # `--systemd=always`, krun `KRUN_INIT_PID1=1`.
+        entrypoint:
+            - /sbin/init
+        candy:
+            - k3s-lease
