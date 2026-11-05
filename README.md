@@ -10,7 +10,7 @@ Every lease contract property of the base image is inherited unchanged:
 
 | Property | Value |
 |---|---|
-| Base | `ghcr.io/opencharly/pod-crabbox-nested:2026.309.0149` (CachyOS) |
+| Base | `ghcr.io/opencharly/pod-crabbox-nested:2026.309.0812` (CachyOS) |
 | SSH | `sshd` on **2222**, public-key only, user `crabbox` |
 | Sudo | `crabbox` has passwordless sudo |
 | Inputs | read-only `/crabbox`: `authorized_keys`, `lease.env`, `bootstrap.sh` |
