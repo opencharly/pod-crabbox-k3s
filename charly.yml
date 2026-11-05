@@ -114,6 +114,18 @@ check-pod-crabbox-k3s-cluster:
         image: pod-crabbox-k3s
         disposable: true
         lifecycle: test
+        # The lease needs CAP_NET_ADMIN to create its node-address link: the
+        # image's own k3s-dummy.service runs `ip link add k3s0 type dummy`, and
+        # podman's DEFAULT capability set does not include NET_ADMIN, so without
+        # this the unit fails with a bare "control process exited with error
+        # code" that reads like a product defect. Measured 2026-11-05: with the
+        # host `dummy` module loaded and usable as root (`ip link add k3sprobe0
+        # type dummy` rc 0 on the host), the bed still failed here until this
+        # capability was granted. This is the consumer declaring what the lease
+        # requires, not a widening of the image's boundary.
+        security:
+            cap_add:
+                - NET_ADMIN
         description: >-
             R10 witness for the pod-crabbox-k3s control-plane lease image: a
             disposable container built from the image boots systemd as PID 1,
