@@ -114,30 +114,42 @@ check-pod-crabbox-k3s-cluster:
         image: pod-crabbox-k3s
         disposable: true
         lifecycle: test
-        # Two capabilities, each measured — neither is a widening of the
-        # image's boundary, both are what the image's own units already do.
+        # The NESTED-LEASE venue, declared exactly as the real Crabbox
+        # `containerd` provider launches a nested lease (crabbox
+        # internal/providers/containerd/transport.go, `Nested == "on"`, krun
+        # off): `--privileged --security-opt privileged-without-host-devices
+        # --device /dev/kmsg`, plus a state volume at `/var`.
         #
-        # NET_ADMIN: the image's k3s-dummy.service runs `ip link add k3s0 type
-        # dummy`, and podman's DEFAULT capability set excludes it, so without
-        # this the unit dies with "RTNETLINK answers: Operation not permitted"
-        # (status=2/INVALIDARGUMENT) — and k3s.service then fails with result
-        # 'dependency', which reads like a k3s defect and is not one.
+        # A capability PAIR is not enough, and each missing half was measured
+        # on this host on the bed's own deploy:
         #
-        # SYS_ADMIN: with NET_ADMIN applied, k3s reaches kubelet's root setup
-        # and dies with `error configuring root directory: failed to
-        # bind-mount /var/lib/kubelet: operation not permitted` (kubelet.go
-        # "Failed to initialize internal modules"). kubelet bind-mounts its
-        # root, and podman's default set excludes SYS_ADMIN.
-        #
-        # Measured 2026-11-05 end to end on a disposable lease of this image:
-        # with both granted (and the host delegating the cpuset controller,
-        # see README "Requirements and limits"), k3s.service is active, 6443
-        # listens, `kubectl get nodes` reports Ready v1.37.0+k3s1, and the
-        # image's readiness hook exits 0.
+        #   - `privileged` is what makes `/proc/sys` writable. Rootless podman
+        #     mounts it READ-ONLY, so kube-proxy's
+        #     `net.ipv4.conf.all.route_localnet=1` fails and k3s exits:
+        #     `level=error msg="Shutdown request received: \"kube-proxy
+        #     exited: unable to create proxier: can't set sysctl
+        #     net/ipv4/conf/all/route_localnet to 1: open ...: read-only file
+        #     system\""`.
+        #   - `privileged` is also what lets the inner containerd's runc apply
+        #     the CRI sandbox capability set (MKNOD, NET_RAW, AUDIT_WRITE are
+        #     absent from rootless podman's defaults).
+        #   - The `/var` state volume is what the `pod-crabbox-nested` contract
+        #     requires (`/var` = the state volume). Without it `/var/lib/
+        #     containerd` sits on the OUTER overlayfs, and the inner overlayfs
+        #     snapshotter refuses it: `fsconfig() failed: overlay: filesystem
+        #     on .../work not supported as upperdir`, surfaced to k3s as
+        #     `failed to mount rootfs component: invalid argument`.
+        #   - `--device /dev/kmsg` is the row's own run flag (CONTAINERD-
+        #     IMAGES.md §2): kubelet reads the kernel ring for eviction
+        #     accounting.
+        # `privileged-without-host-devices` is a NERDCTL security-opt (the real
+        # provider launches a lease with nerdctl); podman 6.x rejects it as
+        # `invalid --security-opt`. The bed's venue is a podman quadlet, so it
+        # declares only `--privileged`.
         security:
-            cap_add:
-                - NET_ADMIN
-                - SYS_ADMIN
+            privileged: true
+            devices:
+                - /dev/kmsg
         description: >-
             R10 witness for the pod-crabbox-k3s control-plane lease image: a
             disposable container built from the image boots systemd as PID 1,
@@ -160,6 +172,9 @@ check-pod-crabbox-k3s-cluster:
             venue, the Docker-compatible socket (issue #1) and the §5 PVC /
             snapshot legs are explicitly not claimed.
         volume:
+            - name: lease-state
+              type: volume
+              path: /var
             - name: lease-inputs
               type: volume
               path: /crabbox
