@@ -177,6 +177,29 @@ k3s-lease:
                 [plugins.'io.containerd.cri.v1.runtime'.cni]
                   bin_dirs = ['/var/lib/rancher/k3s/data/current/bin']
                   conf_dir = '/var/lib/rancher/k3s/agent/etc/cni/net.d'
+            - run: keep the inner CRI from lowering oom_score_adj past the lease's own
+              id: k3s-cri-oom
+              write: /etc/containerd/conf.d/60-k3s-cri-oom.toml
+              run_as: root
+              mode: "0644"
+              content: |
+                # Managed by the opencharly pod-crabbox-k3s candy.
+                #
+                # Kubelet asks the CRI for a sandbox oom_score_adj of -998
+                # (Kubernetes's pod-infra-container protection). A rootless
+                # lease lives in a user namespace with no CAP_SYS_RESOURCE in
+                # the initial namespace, so its inner runtime cannot LOWER the
+                # value: `write to /proc/self/oom_score_adj: Permission denied`,
+                # and every sandbox stays in ContainerCreating — a failure that
+                # reads like a CNI or a kubelet defect and is neither.
+                # `restrict_oom_score_adj` clamps the request to the inner
+                # daemon's own value, which is exactly what containerd
+                # documents the switch for. Measured 2026-11-06 on a disposable
+                # lease of this image: without it the sandbox never starts;
+                # with it k3s reports the node Ready and the readiness hook's
+                # probe pod reaches Ready.
+                [plugins.'io.containerd.cri.v1.runtime']
+                  restrict_oom_score_adj = true
             # ------------------------------------------------------------------
             # k3s-dummy.service: the stable node address link.
             # ------------------------------------------------------------------
@@ -404,6 +427,11 @@ k3s-lease:
               file:
                 file: /etc/containerd/conf.d/50-k3s-cni.toml
                 contains: "/var/lib/rancher/k3s/agent/etc/cni/net.d"
+            - check: the inner CRI clamps oom_score_adj for a rootless lease
+              id: k3s-cri-oom-score-adj
+              file:
+                file: /etc/containerd/conf.d/60-k3s-cri-oom.toml
+                contains: "  restrict_oom_score_adj = true"
             - check: the k3s0 dummy-link script is installed and executable
               id: k3s-dummy-script-installed
               file:
