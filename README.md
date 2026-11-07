@@ -132,7 +132,18 @@ scp -P 2222 crabbox@<lease>:/etc/rancher/k3s/k3s.yaml ~/.kube/config
   slice subtree.** Without it k3s exits with
   `level=fatal msg="Error: failed to find cpuset cgroup (v2)"`. Verify with
   `cat /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/cgroup.subtree_control`
-  — it must list `cpuset`; a `Delegate=` drop-in does not add it.
+  — it must list `cpuset`; a `Delegate=` drop-in does not add it, because
+  systemd 262 only enables the controllers it manages. **A persistent recipe is
+  NOT yet provided** — the delegation was applied at runtime for the run that
+  proved this image, and survives only until the next boot. Tracked as
+  `opencharly/pod-crabbox-k3s#7`.
+- **The host needs roughly 45 GiB free.** kubelet measures the filesystem the
+  lease lives on; below about 10 % free it sets `DiskPressure=True`, taints the
+  node `node.kubernetes.io/disk-pressure:NoSchedule`, and evicts the readiness
+  probe — so PRESENCE fails with `timed out waiting for the condition on pods/…`
+  even though k3s itself started cleanly. Check with `df -h` before running the
+  bed; free space makes the difference between a green and a red gate on an
+  otherwise identical tree.
 - **No `ExecStartPre=modprobe`.** The unit deliberately starts no kernel module;
   the modules k3s needs (`br_netfilter`, `overlay`, `nf_conntrack`) are the
   host's responsibility (CONTAINERD-IMAGES.md §2).
