@@ -78,13 +78,15 @@ pod-crabbox-k3s:
 # The venue is a disposable pod built from the image under review; its container
 # and its input volume are torn down with it.
 #
-# This bed deliberately does NOT claim the containerd substrate: in the pinned
-# toolchain a `pod:` deploy's authored `engine:` selector is dropped by the
-# check-bed `config`/`start` path (`charly config` emits a podman quadlet) and
-# `charly deploy add --engine` is an unknown flag (opencharly/charly#1109). What
-# it proves is this image's OWN running contract on a disposable pod — the same
-# scope its three sibling beds claim. It also does not claim the
-# Docker-compatible socket (opencharly/pod-crabbox-nested#1).
+# This bed deliberately does NOT claim the containerd substrate. That is now a
+# SCOPE choice, not a toolchain limit: charly#1109 is closed and charly#1110
+# landed the fix, so a `pod:` deploy's authored `engine:` selector IS persisted
+# and honoured (the emitted unit carries the selected engine's argv), and
+# `charly deploy add --engine=<word>` exists. A containerd venue still needs a
+# `crun` runtime handler on the host, which is a separate prerequisite — this
+# bed proves the image's OWN running contract on a disposable pod, the same
+# scope its sibling beds claim. It also does not claim the Docker-compatible
+# socket (opencharly/pod-crabbox-nested#1).
 #
 # Three steps, in the order that makes the bed a gate rather than a snapshot:
 #   1. ABSENCE  — reset the k3s state, then prove k3s is NOT serving (unit
